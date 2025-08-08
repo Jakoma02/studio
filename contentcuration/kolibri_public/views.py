@@ -33,7 +33,7 @@ from django_filters.rest_framework import FilterSet
 from django_filters.rest_framework import NumberFilter
 from django_filters.rest_framework import UUIDFilter
 from kolibri_public import models
-from kolibri_public.search import get_available_metadata_labels
+from kolibri_public.search import get_available_contentnode_metadata_labels
 from kolibri_public.stopwords import stopwords_set
 from le_utils.constants import content_kinds
 from rest_framework import status
@@ -533,7 +533,10 @@ class OptionalContentNodePagination(ValuesViewsetCursorPagination):
                 [
                     ("more", self.get_more()),
                     ("results", data),
-                    ("labels", get_available_metadata_labels(self.queryset)),
+                    (
+                        "labels",
+                        get_available_contentnode_metadata_labels(self.queryset),
+                    ),
                 ]
             )
         )

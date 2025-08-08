@@ -1,9 +1,15 @@
 from django.db import models
-from django.db.models import F
 from kolibri_content import base_models
 from kolibri_content.fields import JSONField
-from kolibri_public.search import bitmask_fieldnames
-from kolibri_public.search import metadata_bitmasks
+from kolibri_public.search import BitmaskFieldsMixin
+from kolibri_public.search import BitmaskFieldsQueryset
+from le_utils.constants.labels.accessibility_categories import (
+    ACCESSIBILITYCATEGORIESLIST,
+)
+from le_utils.constants.labels.learning_activities import LEARNINGACTIVITIESLIST
+from le_utils.constants.labels.levels import LEVELSLIST
+from le_utils.constants.labels.needs import NEEDSLIST
+from le_utils.constants.labels.subjects import SUBJECTSLIST
 from mptt.managers import TreeManager
 from mptt.querysets import TreeQuerySet
 
@@ -15,33 +21,8 @@ class ContentTag(base_models.ContentTag):
     pass
 
 
-class ContentNodeQueryset(TreeQuerySet):
-    def has_all_labels(self, field_name, labels):
-        bitmasks = metadata_bitmasks[field_name]
-        bits = {}
-        for label in labels:
-            if label in bitmasks:
-                bitmask_fieldname = bitmasks[label]["bitmask_field_name"]
-                if bitmask_fieldname not in bits:
-                    bits[bitmask_fieldname] = 0
-                bits[bitmask_fieldname] += bitmasks[label]["bits"]
-
-        filters = {}
-        annotations = {}
-        for bitmask_fieldname, bits in bits.items():
-            annotation_fieldname = "{}_{}".format(bitmask_fieldname, "masked")
-            # To get the correct result, i.e. an AND that all the labels are present,
-            # we need to check that the aggregated value is euqal to the bits.
-            # If we wanted an OR (which would check for any being present),
-            # we would have to use GREATER THAN 0 here.
-            filters[annotation_fieldname] = bits
-            # This ensures that the annotated value is the result of the AND operation
-            # so if all the values are present, the result will be the same as the bits
-            # but if any are missing, it will not be equal to the bits, but will only be
-            # 0 if none of the bits are present.
-            annotations[annotation_fieldname] = F(bitmask_fieldname).bitand(bits)
-
-        return self.annotate(**annotations).filter(**filters)
+class ContentNodeQueryset(TreeQuerySet, BitmaskFieldsQueryset):
+    pass
 
 
 class ContentNodeManager(
@@ -58,7 +39,15 @@ class ContentNodeManager(
         )
 
 
-class ContentNode(base_models.ContentNode):
+class ContentNode(base_models.ContentNode, BitmaskFieldsMixin):
+    bitmask_metadata_lookup = {
+        "learning_activities": LEARNINGACTIVITIESLIST,
+        "categories": SUBJECTSLIST,
+        "grade_levels": LEVELSLIST,
+        "accessibility_labels": ACCESSIBILITYCATEGORIESLIST,
+        "learner_needs": NEEDSLIST,
+    }
+
     lang = models.ForeignKey(Language, blank=True, null=True, on_delete=models.SET_NULL)
 
     # Fields used only on Kolibri and not imported from a content database
@@ -79,11 +68,6 @@ class ContentNode(base_models.ContentNode):
     objects = ContentNodeManager()
 
 
-for field_name in bitmask_fieldnames:
-    field = models.BigIntegerField(default=0, null=True, blank=True)
-    field.contribute_to_class(ContentNode, field_name)
-
-
 class File(base_models.File):
     lang = models.ForeignKey(Language, blank=True, null=True, on_delete=models.SET_NULL)
 
@@ -96,8 +80,12 @@ class AssessmentMetaData(base_models.AssessmentMetaData):
     pass
 
 
-class ChannelMetadata(base_models.ChannelMetadata):
+class ChannelMetadata(base_models.ChannelMetadata, BitmaskFieldsMixin):
     # Note: The `categories` field should contain a _list_, NOT a _dict_.
+
+    bitmask_metadata_lookup = {
+        "categories": SUBJECTSLIST,
+    }
 
     # precalculated fields during annotation/migration
     published_size = models.BigIntegerField(default=0, null=True, blank=True)

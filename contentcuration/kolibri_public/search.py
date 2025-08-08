@@ -12,51 +12,80 @@ import hashlib
 
 from django.contrib.postgres.aggregates import BitOr
 from django.core.cache import cache
+from django.db import models
 from django.db.models import Case
 from django.db.models import F
 from django.db.models import Max
 from django.db.models import Value
 from django.db.models import When
-from le_utils.constants.labels.accessibility_categories import (
-    ACCESSIBILITYCATEGORIESLIST,
-)
-from le_utils.constants.labels.learning_activities import LEARNINGACTIVITIESLIST
-from le_utils.constants.labels.levels import LEVELSLIST
-from le_utils.constants.labels.needs import NEEDSLIST
-from le_utils.constants.labels.subjects import SUBJECTSLIST
 
 
-metadata_lookup = {
-    "learning_activities": LEARNINGACTIVITIESLIST,
-    "categories": SUBJECTSLIST,
-    "grade_levels": LEVELSLIST,
-    "accessibility_labels": ACCESSIBILITYCATEGORIESLIST,
-    "learner_needs": NEEDSLIST,
-}
+class BitmaskFieldsQueryset(models.query.QuerySet):
+    def has_all_labels(self, field_name, labels):
+        """
+        Returns a queryset that filters for nodes that have all the specified labels
+        in the specified field.
+        """
+        bitmasks = self.model.metadata_bitmasks[field_name]
+        bits = {}
+        for label in labels:
+            if label in bitmasks:
+                bitmask_fieldname = bitmasks[label]["bitmask_field_name"]
+                if bitmask_fieldname not in bits:
+                    bits[bitmask_fieldname] = 0
+                bits[bitmask_fieldname] += bitmasks[label]["bits"]
+
+        filters = {}
+        annotations = {}
+        for bitmask_fieldname, bits in bits.items():
+            annotation_fieldname = "{}_{}".format(bitmask_fieldname, "masked")
+            filters[annotation_fieldname] = bits
+            annotations[annotation_fieldname] = F(bitmask_fieldname).bitand(bits)
+
+        return self.annotate(**annotations).filter(**filters)
 
 
-metadata_bitmasks = {}
+class BitmaskFieldsMixin:
+    def __init_subclass__(cls, **kwargs):
+        if not hasattr(cls, "bitmask_metadata_lookup"):
+            raise ValueError(
+                "Subclasses of BitmaskFieldsMixin must define a 'bitmask_metadata_lookup' class attribute."
+            )
 
-bitmask_fieldnames = {}
+        super().__init_subclass__(**kwargs)
 
+        cls.metadata_bitmasks = {}
+        cls.bitmask_fieldnames = {}
+        cls._populate_bitmask_data()
+        cls._create_bitmask_fields()
 
-for key, labels in metadata_lookup.items():
-    bitmask_lookup = {}
-    i = 0
-    while labels[i : i + 64]:
-        bitmask_field_name = "{}_bitmask_{}".format(key, i)
-        bitmask_fieldnames[bitmask_field_name] = []
-        for j, label in enumerate(labels):
-            info = {
-                "bitmask_field_name": bitmask_field_name,
-                "field_name": key,
-                "bits": 2 ** j,
-                "label": label,
-            }
-            bitmask_lookup[label] = info
-            bitmask_fieldnames[bitmask_field_name].append(info)
-        i += 64
-    metadata_bitmasks[key] = bitmask_lookup
+        cls.objects = models.Manager.from_queryset(BitmaskFieldsQueryset)
+
+    @classmethod
+    def _populate_bitmask_data(cls):
+        for key, labels in cls.bitmask_metadata_lookup.items():
+            bitmask_lookup = {}
+            i = 0
+            while (chunk := labels[i : i + 64]) :
+                bitmask_field_name = "{}_bitmask_{}".format(key, i)
+                cls.bitmask_fieldnames[bitmask_field_name] = []
+                for j, label in enumerate(chunk):
+                    info = {
+                        "bitmask_field_name": bitmask_field_name,
+                        "field_name": key,
+                        "bits": 2 ** (64 * i + j),
+                        "label": label,
+                    }
+                    bitmask_lookup[label] = info
+                    cls.bitmask_fieldnames[bitmask_field_name].append(info)
+                i += 64
+            cls.metadata_bitmasks[key] = bitmask_lookup
+
+    @classmethod
+    def _create_bitmask_fields(cls):
+        for bitmask_fieldname in cls.bitmask_fieldnames:
+            field = models.BigIntegerField(default=0, null=True, blank=True)
+            field.contribute_to_class(cls, bitmask_fieldname)
 
 
 def _get_available_languages(base_queryset):
@@ -87,9 +116,11 @@ def _get_available_channels(base_queryset):
 # Remove the SQLite Bitwise OR definition as not needed.
 
 
-def get_available_metadata_labels(base_queryset):
+def get_available_contentnode_metadata_labels(base_queryset):
     # Updated to use the kolibri_public ChannelMetadata model
     from kolibri_public.models import ChannelMetadata
+
+    model = base_queryset.model
 
     content_cache_key = str(
         ChannelMetadata.objects.all().aggregate(updated=Max("last_updated"))["updated"]
@@ -101,12 +132,12 @@ def get_available_metadata_labels(base_queryset):
     if cache_key not in cache:
         base_queryset = base_queryset.order_by()
         aggregates = {}
-        for field in bitmask_fieldnames:
+        for field in model.bitmask_fieldnames:
             field_agg = field + "_agg"
             aggregates[field_agg] = BitOr(field)
         output = {}
         agg = base_queryset.aggregate(**aggregates)
-        for field, values in bitmask_fieldnames.items():
+        for field, values in model.bitmask_fieldnames.items():
             bit_value = agg[field + "_agg"]
             for value in values:
                 if value["field_name"] not in output:
@@ -123,12 +154,16 @@ def get_all_contentnode_label_metadata():
     # Updated to use the kolibri_public ContentNode model
     from kolibri_public.models import ContentNode
 
-    return get_available_metadata_labels(ContentNode.objects.filter(available=True))
+    return get_available_contentnode_metadata_labels(
+        ContentNode.objects.filter(available=True)
+    )
 
 
 def annotate_label_bitmasks(queryset):
+    model = queryset.model
+
     update_statements = {}
-    for bitmask_fieldname, label_info in bitmask_fieldnames.items():
+    for bitmask_fieldname, label_info in model.bitmask_fieldnames.items():
         update_statements[bitmask_fieldname] = sum(
             Case(
                 When(
